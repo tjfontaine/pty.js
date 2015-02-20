@@ -101,6 +101,28 @@ init(Handle<Object>);
  * pty.fork(file, args, env, cwd, cols, rows[, uid, gid])
  */
 
+struct AsyncBaton {
+  Persistent<Function> cb;
+  int exit_code;
+  uv_async_t *async;
+};
+
+void
+WaitOnPid(AsyncBaton *baton) {
+  waitpid();
+  baton->exit_code = 0; // errno?
+  uv_async_send(baton->async);
+}
+
+void
+AfterWaitOnPid(uv_async_t *async) {
+  AsyncBaton *baton = async->data;
+  Local<Function> cb = NanNew<Function>(baton->cb);
+  NanMakeCallback(NanNull(), cb, 1, NanNew<Integer>(baton->exit_code));
+  delete baton;
+  free(async);
+}
+
 NAN_METHOD(PtyFork) {
   NanScope();
 
@@ -112,7 +134,8 @@ NAN_METHOD(PtyFork) {
       || !args[4]->IsNumber()
       || !args[5]->IsNumber()
       || (args.Length() >= 8 && !args[6]->IsNumber())
-      || (args.Length() >= 8 && !args[7]->IsNumber())) {
+      || (args.Length() >= 8 && !args[7]->IsNumber())
+      || (args.Length() >= 9 && !args[8]->IsFunction())) {
     return NanThrowError(
       "Usage: pty.fork(file, args, env, cwd, cols, rows[, uid, gid])");
   }
@@ -210,6 +233,23 @@ NAN_METHOD(PtyFork) {
       obj->Set(NanNew<String>("pty"), NanNew<String>(name));
 
       NanReturnValue(obj);
+  }
+
+  if (args.Length() >= 9) {
+    uv_async_t *async_handle = malloc(sizeof(uv_async_t));
+    AsyncBaton *baton = new AsyncBaton();
+    baton->exit_code = 0;
+    NanAssignPersistent(args[8].As<Function>(), baton->cb);
+
+    async_handle->data = baton;
+    baton->async = async_handle;
+
+    uv_async_init(uv_default_loop(), async_handle, AfterWaitOnPid);
+
+    // Don't touch the CB in this thread
+    // XXX allocate thread
+    // XXX clean up thread in AfterWaitOnPid?
+    uv_thread_create(&thread, WaitOnPid, baton);
   }
 
   NanReturnUndefined();
