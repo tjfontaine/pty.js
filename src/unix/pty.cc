@@ -104,23 +104,46 @@ init(Handle<Object>);
 struct AsyncBaton {
   Persistent<Function> cb;
   int exit_code;
-  uv_async_t *async;
+  int signal_code;
+  pid_t pid;
+  uv_async_t async;
+  uv_thread_t tid;
 };
 
 void
-WaitOnPid(AsyncBaton *baton) {
-  waitpid();
-  baton->exit_code = 0; // errno?
-  uv_async_send(baton->async);
+WaitOnPid(void *data) {
+  int ret;
+  int stat_loc;
+
+  AsyncBaton *baton = static_cast<AsyncBaton*>(data);
+
+  errno = 0;
+
+  if ((ret = waitpid(baton->pid, &stat_loc, 0)) != baton->pid) {
+    if (ret == -1 && errno == EINTR)
+      return WaitOnPid(baton);
+    assert(false);
+  }
+
+  if (WIFEXITED(stat_loc))
+    baton->exit_code = WEXITSTATUS(stat_loc); // errno?
+
+  if (WIFSIGNALED(stat_loc))
+    baton->signal_code = WTERMSIG(stat_loc);
+
+  uv_async_send(&baton->async);
 }
 
 void
 AfterWaitOnPid(uv_async_t *async) {
-  AsyncBaton *baton = async->data;
+  AsyncBaton *baton = static_cast<AsyncBaton*>(async->data);
   Local<Function> cb = NanNew<Function>(baton->cb);
-  NanMakeCallback(NanNull(), cb, 1, NanNew<Integer>(baton->exit_code));
+  Local<Value> argv[] = {
+          NanNew<Integer>(baton->exit_code),
+          NanNew<Integer>(baton->signal_code),
+  };
+  NanMakeCallback(NanGetCurrentContext()->Global(), cb, 2, argv);
   delete baton;
-  free(async);
 }
 
 NAN_METHOD(PtyFork) {
@@ -232,25 +255,26 @@ NAN_METHOD(PtyFork) {
       obj->Set(NanNew<String>("pid"), NanNew<Number>(pid));
       obj->Set(NanNew<String>("pty"), NanNew<String>(name));
 
+      if (args.Length() >= 9) {
+        AsyncBaton *baton = new AsyncBaton();
+        baton->exit_code = 0;
+        Local<Function> cb = args[8].As<Function>();
+        NanAssignPersistent<Function>(baton->cb, cb);
+    
+        baton->pid = pid;
+        baton->async.data = baton;
+    
+        uv_async_init(uv_default_loop(), &baton->async, AfterWaitOnPid);
+    
+        // Don't touch the CB in this thread
+        // XXX allocate thread
+        // XXX clean up thread in AfterWaitOnPid?
+        uv_thread_create(&baton->tid, WaitOnPid, static_cast<void*>(baton));
+      }
+
       NanReturnValue(obj);
   }
 
-  if (args.Length() >= 9) {
-    uv_async_t *async_handle = malloc(sizeof(uv_async_t));
-    AsyncBaton *baton = new AsyncBaton();
-    baton->exit_code = 0;
-    NanAssignPersistent(args[8].As<Function>(), baton->cb);
-
-    async_handle->data = baton;
-    baton->async = async_handle;
-
-    uv_async_init(uv_default_loop(), async_handle, AfterWaitOnPid);
-
-    // Don't touch the CB in this thread
-    // XXX allocate thread
-    // XXX clean up thread in AfterWaitOnPid?
-    uv_thread_create(&thread, WaitOnPid, baton);
-  }
 
   NanReturnUndefined();
 }
